@@ -1,12 +1,15 @@
 [package]
 name = "bip47"
 version = "0.3.0"
-authors = ["Straylight <https://github.com/straylight-orbit>"]
+authors = ["Straylight <https://github.com/straylight-orbit>", "Spartacus <https://github.com/spartacus2523>"]
 license = "CC0-1.0"
 description = "BIP47 (Reusable Payment Codes) implementation"
 repository = "https://github.com/straylight-orbit/rust-bip47"
 keywords = ["bitcoin", "bip47"]
 readme = "README.md"
+edition = "2021"
+rust-version="1.56.1"
 
 [dependencies]
-bitcoin = "0.28"
+bitcoin = "0.32.5"
+thiserror = "2.0.12"

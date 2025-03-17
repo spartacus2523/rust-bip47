@@ -10,49 +10,34 @@
 // You should have received a copy of the CC0 Public Domain Dedication
 // along with this software.
 // If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
-
-//! # Rust BIP47 Library
-//!
-//! This library implements the BIP47 standard and provides functionality
-//! for generating static payment codes that two parties can use to create
-//! a private payment address space between them.
-//!
-//! Original specification: [BIP-0047](https://github.com/bitcoin/bips/blob/master/bip-0047.mediawiki).
-//!
-//! ## Usage
-//! ```
-//! # extern crate bitcoin;
-//! # extern crate bip47;
-//! # use {bip47::PrivateCode, bip47::PublicCode, bitcoin::Network};
-//! # let alice_seed = [0_u8];
-//! // Alice constructs her own payment code using a BIP32 seed
-//! let alice_private = PrivateCode::from_seed(&alice_seed, 0, Network::Bitcoin).unwrap();
-//!
-//! // Alice parses Bob's payment code
-//! let bob_public = PublicCode::from_wif("PM8TJS2JxQ5ztXUpBBRnpTbcUXbUHy2T1abfrb3KkAAtMEGNbey4oumH7Hc578WgQJhPjBxteQ5GHHToTYHE3A1w6p7tU6KSoFmWBVbFGjKPisZDbP97").unwrap();
-//!
-//! // Alice calculates Bob's receive address at index 0, known only to them
-//! let bob_address_0 = bob_public.address(&alice_private, 0, false).unwrap();
-//!
-//! // Alice can now pay Bob privately
-//! assert_eq!("12edoJAofkjCsWrtmVjuQgMUKJ6Z7Ntpzx", bob_address_0.to_string());
-//!
-//! ```
-
-use std::str::FromStr;
-
 pub extern crate bitcoin;
+pub extern crate thiserror;
 
-use bitcoin::hashes::{sha256, Hash};
-use bitcoin::secp256k1::Secp256k1;
-use bitcoin::util::address::{self, Address};
-use bitcoin::util::bip32::{ChainCode, ChildNumber, DerivationPath, ExtendedPubKey};
-use bitcoin::util::psbt::serialize::Serialize;
-use bitcoin::util::{base58, bip32};
-use bitcoin::{secp256k1, OutPoint, PrivateKey, PublicKey, Script, Transaction};
+use std::{
+    convert::{TryFrom, TryInto},
+    str::FromStr,
+};
+
+use bitcoin::{
+    address::{self, Address},
+    base58,
+    bip32::{self, ChainCode, ChildNumber, DerivationPath, Xpriv, Xpub},
+    blockdata::{
+        opcodes::all as opcode,
+        script::{Builder, Instruction::PushBytes, PushBytesBuf},
+    },
+    hashes::{self, sha256, sha512, Hash, HashEngine, Hmac},
+    key::UncompressedPublicKeyError,
+    secp256k1::{self, Secp256k1},
+    CompressedPublicKey, Network, NetworkKind, OutPoint, PrivateKey, PublicKey, ScriptBuf,
+    Transaction,
+};
+
+use thiserror::Error;
 
 const PAYMENT_CODE_BIN_LENGTH: usize = 80;
 const LETTER_P: u8 = 0x47;
+const ENCODED_PCODE_PREFIX: [u8; 3] = [0x6a, 0x4c, 0x50]; // OP_RETURN + PUSHDATA1 + 80-byte length
 
 /// Represents the version number of a BIP47 payment code.
 #[derive(Debug, Clone)]
@@ -80,26 +65,41 @@ impl Version {
     }
 }
 
+/// Represents derivable addresses for a Payment code
+#[derive(Debug, Clone)]
+pub enum AddressType {
+    P2PKH,
+    P2WPKH,
+}
+
 /// Represents the private side of a payment code, as seen from the perspective of the sender.
 /// This is what the sender will use in conjunction with a receiver's public payment code in order
 /// to be able to send funds.
 pub struct PrivateCode {
-    identity_key: bip32::ExtendedPrivKey,
+    identity_key: Xpriv,
     curve: Secp256k1<secp256k1::All>,
     network: bitcoin::Network,
 }
 
 impl PrivateCode {
     /// Constructs a new payment code from the private side using a BIP32 seed.
+    ///
+    /// # Arguments
+    ///
+    /// * `seed` - The BIP32 seed to use for the payment code.
+    /// * `network` - The network to use for the payment code.
+    /// * `account` - The account to use for the payment code.
+    /// * `path` - The derivation path to use for the payment code. Overrides account if provided.
     pub fn from_seed(
         seed: &[u8],
-        account: u32,
         network: bitcoin::Network,
+        account: Option<u32>,
+        path: Option<&str>, // Overrides derivation path
     ) -> Result<Self, bip32::Error> {
         let curve = Secp256k1::new();
-        let path = DerivationPath::from_str(&format!("m/47'/0'/{}'", account))?;
-        let root_key = bip32::ExtendedPrivKey::new_master(network, seed)?;
-        let identity_key = root_key.derive_priv(&curve, &path)?;
+        let root_key = Xpriv::new_master(network, seed)?;
+        let derivation_path = PrivateCode::get_derivation_path(network, account, path)?;
+        let identity_key = root_key.derive_priv(&curve, &derivation_path)?;
 
         Ok(Self {
             identity_key,
@@ -108,29 +108,28 @@ impl PrivateCode {
         })
     }
 
-    /// Constructs a new **ephemeral** payment code at the given index from the private side using a BIP32 seed.
-    pub fn from_seed_ephemeral(
-        seed: &[u8],
-        account: u32,
-        network: bitcoin::Network,
-        ephemeral_index: u32,
-    ) -> Result<Self, bip32::Error> {
-        let curve = Secp256k1::new();
-        let path =
-            DerivationPath::from_str(&format!("m/47'/0'/{}'/{}'", account, ephemeral_index))?;
-        let root_key = bip32::ExtendedPrivKey::new_master(network, seed)?;
-        let identity_key = root_key.derive_priv(&curve, &path)?;
-
-        Ok(Self {
-            identity_key,
-            curve,
-            network,
-        })
+    fn get_derivation_path(
+        network: Network,
+        account: Option<u32>,
+        path: Option<&str>,
+    ) -> Result<DerivationPath, bip32::Error> {
+        let network_kind = NetworkKind::from(network);
+        let chain_id = if network_kind.is_mainnet() { 0 } else { 1 };
+        match path {
+            Some(p) => Ok(DerivationPath::from_str(p)?),
+            None => match account {
+                Some(a) => Ok(DerivationPath::from_str(&format!(
+                    "m/47'/{}'/{}'",
+                    chain_id, a
+                ))?),
+                None => Err(bip32::Error::InvalidDerivationPathFormat),
+            },
+        }
     }
 
     /// Generates a version 1 public payment code matching this private payment code, optionally with bitmessage.
     pub fn v1_public_code(&self, bitmessage: Option<BitMessagePreference>) -> PublicCode {
-        let xpub = ExtendedPubKey::from_priv(&self.curve, &self.identity_key);
+        let xpub = Xpub::from_priv(&self.curve, &self.identity_key);
 
         PublicCode {
             version: Version::V1,
@@ -143,7 +142,7 @@ impl PrivateCode {
 
     /// Generates a version 2 public payment code matching this private payment code.
     pub fn v2_public_code(&self) -> PublicCode {
-        let xpub = ExtendedPubKey::from_priv(&self.curve, &self.identity_key);
+        let xpub = Xpub::from_priv(&self.curve, &self.identity_key);
 
         PublicCode {
             version: Version::V1,
@@ -157,8 +156,7 @@ impl PrivateCode {
     /// Derives a child private key at the given index. If the result is invalid, the index should be incremented.
     fn child(&self, i: u32) -> Result<PrivateKey, bip32::Error> {
         let child_number = ChildNumber::from_normal_idx(i)?;
-        let key = self.identity_key.ckd_priv(&self.curve, child_number)?;
-
+        let key = self.identity_key.derive_priv(&self.curve, &child_number)?;
         Ok(key.to_priv())
     }
 
@@ -169,12 +167,11 @@ impl PrivateCode {
         let pk = sender_code.child(0)?;
         let sp = secret_point(&sk, pk)?;
         let ss = shared_secret(sp)?;
+        let ss_scalar = secp256k1::Scalar::from_be_bytes(ss)?;
+        let sk_tweaked = sk.inner.add_tweak(&ss_scalar)?;
+        let sk_priv = PrivateKey::new(sk_tweaked, self.network);
 
-        let mut sk_prime = sk.inner;
-        sk_prime.add_assign(&ss)?;
-        let sk_prime = PrivateKey::new(sk_prime, self.network);
-
-        Ok(sk_prime)
+        Ok(sk_priv)
     }
 
     /// Derives a receive address at the given index. If the index is invalid, it should be incremented.
@@ -182,16 +179,11 @@ impl PrivateCode {
         &self,
         sender_code: &PublicCode,
         i: u32,
-        segwit: bool,
+        address_type: &AddressType,
     ) -> Result<Address, Error> {
         let sk_prime = self.private_key(sender_code, i)?;
-        let pk_prime = PublicKey::from_private_key(&self.curve, &sk_prime);
-
-        if segwit {
-            Address::p2wpkh(&pk_prime, self.network).map_err(Error::Address)
-        } else {
-            Ok(Address::p2pkh(&pk_prime, self.network))
-        }
+        let pk = CompressedPublicKey::from_private_key(&self.curve, &sk_prime)?;
+        get_address_from_pubkey(&pk, self.network, address_type)
     }
 }
 
@@ -201,7 +193,7 @@ impl PrivateCode {
 pub struct PublicCode {
     version: Version,
     bitmessage: Option<BitMessagePreference>,
-    xpub: ExtendedPubKey,
+    xpub: Xpub,
     curve: Secp256k1<secp256k1::All>,
     pub network: bitcoin::Network,
 }
@@ -232,7 +224,7 @@ impl PublicCode {
     }
 
     /// Derives the child public key at the given index. If the result is invalid, the index should be incremented.
-    fn child(&self, i: u32) -> Result<PublicKey, bip32::Error> {
+    fn child(&self, i: u32) -> Result<CompressedPublicKey, bip32::Error> {
         let child_number = ChildNumber::from_normal_idx(i)?;
         let key = self.xpub.ckd_pub(&self.curve, child_number)?.to_pub();
 
@@ -240,7 +232,12 @@ impl PublicCode {
     }
 
     /// Derives a send address at the given index. If the index is invalid, it should be incremented.
-    pub fn address(&self, code: &PrivateCode, i: u32, segwit: bool) -> Result<Address, Error> {
+    pub fn address(
+        &self,
+        code: &PrivateCode,
+        i: u32,
+        address_type: &AddressType,
+    ) -> Result<Address, Error> {
         let sk = code.child(0)?;
         let pk = self.child(i)?;
         let sp = secret_point(&sk, pk)?;
@@ -248,13 +245,9 @@ impl PublicCode {
 
         let ss = secp256k1::SecretKey::from_slice(&ss)?;
         let sg = secp256k1::PublicKey::from_secret_key(&self.curve, &ss);
-        let pk_prime = PublicKey::new(sg.combine(&pk.inner)?);
-
-        if segwit {
-            Address::p2wpkh(&pk_prime, self.network).map_err(Error::Address)
-        } else {
-            Ok(Address::p2pkh(&pk_prime, self.network))
-        }
+        let pk_prime = PublicKey::new(sg.combine(&pk.0)?);
+        let pk_compressed = CompressedPublicKey::try_from(pk_prime)?;
+        get_address_from_pubkey(&pk_compressed, self.network, address_type)
     }
 
     /// Interprets the payment code as an 80 byte long array.
@@ -294,8 +287,8 @@ impl PublicCode {
                 ))?;
 
         let notification_sk = receiver_code.child(0)?;
-
-        let blinding_factor = blinding_factor(&notification_sk, &designated_pk, &designated_utxo)?;
+        let compressed_pk = CompressedPublicKey::try_from(designated_pk)?;
+        let blinding_factor = blinding_factor(&notification_sk, &compressed_pk, &designated_utxo)?;
 
         let op_return = tx
             .output
@@ -303,13 +296,11 @@ impl PublicCode {
             .find(|out| out.script_pubkey.is_op_return())
             .ok_or(Error::Notification("OP_RETURN not found"))?;
 
-        use bitcoin::blockdata::script::Instruction::PushBytes;
-
         // skip the OP_RETURN opcode, move on to the actual bytes
         if let Some(Ok(PushBytes(data))) = op_return.script_pubkey.instructions().nth(1) {
             if data.len() == PAYMENT_CODE_BIN_LENGTH {
                 let mut code_bytes: [u8; PAYMENT_CODE_BIN_LENGTH] = [0; PAYMENT_CODE_BIN_LENGTH];
-                code_bytes.copy_from_slice(data);
+                code_bytes.copy_from_slice(data.as_bytes());
 
                 blind_payment_code(&mut code_bytes, &blinding_factor);
 
@@ -330,8 +321,7 @@ impl std::fmt::Display for PublicCode {
 
         extended.push(LETTER_P);
         extended.extend_from_slice(&bytes);
-
-        base58::check_encode_slice_to_fmt(f, &extended)
+        base58::encode_check_to_fmt(f, &extended)
     }
 }
 
@@ -343,8 +333,9 @@ impl PublicCode {
 
         let version = Version::from_byte(payment_code[0])?;
         let bitmessage = payment_code[1] == 0x80;
-        let public_key = PublicKey::from_slice(&payment_code[2..35])?.inner;
-        let chain_code = ChainCode::from(&payment_code[35..67]);
+        let public_key = secp256k1::PublicKey::from_slice(&payment_code[2..35])?;
+        let pay_code_slice: [u8; 32] = payment_code[35..67].try_into()?;
+        let chain_code = ChainCode::from(pay_code_slice);
         let bitmessage = if bitmessage {
             Some(BitMessagePreference {
                 version: payment_code[67],
@@ -354,10 +345,10 @@ impl PublicCode {
             None
         };
 
-        // when parsing a WIF-formatted paymenty code, we assume mainnet
-        let network = bitcoin::Network::Bitcoin;
+        // when parsing a WIF-formatted payment code, we assume mainnet
+        let network = bitcoin::NetworkKind::Main;
 
-        let xpub = ExtendedPubKey {
+        let xpub = Xpub {
             network,
             chain_code,
             child_number: ChildNumber::Normal { index: 0 },
@@ -371,12 +362,12 @@ impl PublicCode {
             bitmessage,
             xpub,
             curve: Secp256k1::new(),
-            network,
+            network: bitcoin::Network::Bitcoin,
         })
     }
 
     fn try_from_str(value: &str) -> Result<Self, Error> {
-        let payment_code = base58::from_check(value).map_err(Error::Base58)?;
+        let payment_code = base58::decode_check(value).map_err(Error::Base58)?;
 
         if payment_code.first() != Some(&LETTER_P) {
             return Err(Error::Format("Incorrect version bytes"));
@@ -397,11 +388,11 @@ pub enum NotificationMode<'a> {
 /// an on-chain notification message.
 pub struct BasicTransaction<'a>(&'a PublicCode);
 
-impl<'a> BasicTransaction<'a> {
+impl BasicTransaction<'_> {
     /// Derives the notification pubkey belonging to this payment code. This is exposed in case the
     /// consumer needs the notification pubkey for any reason, such as for manual blinding operations.
     /// Under normal circumstances, it is sufficient to use `notification_address`.
-    pub fn notification_pubkey(&self) -> Result<PublicKey, Error> {
+    pub fn notification_pubkey(&self) -> Result<CompressedPublicKey, Error> {
         let child = self
             .0
             .xpub
@@ -412,14 +403,10 @@ impl<'a> BasicTransaction<'a> {
     }
 
     /// Derives the notification address belonging to this payment code.
-    pub fn notification_address(&self, segwit: bool) -> Result<Address, Error> {
+    pub fn notification_address(&self, address_type: &AddressType) -> Result<Address, Error> {
         let key = self.notification_pubkey()?;
 
-        if segwit {
-            Address::p2wpkh(&key, self.0.network).map_err(Error::Address)
-        } else {
-            Ok(Address::p2pkh(&key, self.0.network))
-        }
+        get_address_from_pubkey(&key, self.0.network, address_type)
     }
 
     /// Generates output scripts (scriptpubkeys) for a v1 notification transaction. Both outputs must
@@ -429,7 +416,7 @@ impl<'a> BasicTransaction<'a> {
         sender_code: &PublicCode,
         notification_sk: &PrivateKey,
         notification_utxo: &bitcoin::OutPoint,
-    ) -> Result<(Script, Script), Error> {
+    ) -> Result<(ScriptBuf, ScriptBuf), Error> {
         make_v1_notification_scripts(sender_code, self.0, notification_sk, notification_utxo)
     }
 
@@ -447,7 +434,7 @@ pub struct Bitmessage<'a> {
     preferences: &'a BitMessagePreference,
 }
 
-impl<'a> Bitmessage<'a> {
+impl Bitmessage<'_> {
     /// Makes the required parameters needed to send a bitmessage to a recipient.
     pub fn make_send_params(&self, n: u32) -> Result<BitMessageSendParams, Error> {
         let signing_key = self
@@ -477,14 +464,14 @@ impl<'a> Bitmessage<'a> {
 /// constructing an on-chain notification message.
 pub struct BloomMultisig<'a>(&'a PublicCode);
 
-impl<'a> BloomMultisig<'a> {
+impl BloomMultisig<'_> {
     /// Generates a bloom filter identifier to watch for. This is what the receiving party
     /// should add to their bloom filter in order to notice bloom filter type notifications.
     pub fn identifier(&self) -> Vec<u8> {
         let hashed_payment_code = sha256::Hash::hash(&self.0.as_bytes());
         let mut identifier = Vec::with_capacity(33);
         identifier.push(0x02_u8);
-        identifier.extend_from_slice(&hashed_payment_code);
+        identifier.extend_from_slice(&hashed_payment_code.to_byte_array());
         identifier
     }
 
@@ -494,11 +481,8 @@ impl<'a> BloomMultisig<'a> {
         sender_code: &PublicCode,
         notification_sk: &PrivateKey,
         notification_utxo: &bitcoin::OutPoint,
-        change_pk: &PublicKey,
-    ) -> Result<(Script, Script), Error> {
-        use bitcoin::blockdata::opcodes::all as opcode;
-        use bitcoin::blockdata::script::Builder;
-
+        change_pk: &CompressedPublicKey,
+    ) -> Result<(ScriptBuf, ScriptBuf), Error> {
         let op_return_script = {
             let notification_pk = self.0.child(0)?;
             let blinding_factor =
@@ -506,22 +490,25 @@ impl<'a> BloomMultisig<'a> {
 
             let mut sender_code = sender_code.as_bytes();
             blind_payment_code(&mut sender_code, &blinding_factor);
-
-            Script::new_op_return(&sender_code)
+            let mut script_bytes = ENCODED_PCODE_PREFIX.to_vec();
+            script_bytes.extend_from_slice(&sender_code);
+            ScriptBuf::from(script_bytes)
         };
 
         // lexicographic ordering
-        let serialized_pk = change_pk.serialize();
+        let serialized_pk = change_pk.to_bytes().to_vec();
         let identifier = self.identifier();
         let (first_push, second_push) = match &serialized_pk.cmp(&identifier) {
             std::cmp::Ordering::Less => (serialized_pk, identifier),
             _ => (identifier, serialized_pk),
         };
+        let first_push_bytes = PushBytesBuf::try_from(first_push)?;
+        let second_push_bytes = PushBytesBuf::try_from(second_push)?;
 
         let multisig_script = Builder::new()
             .push_opcode(opcode::OP_PUSHNUM_1)
-            .push_slice(&first_push)
-            .push_slice(&second_push)
+            .push_slice(&first_push_bytes)
+            .push_slice(&second_push_bytes)
             .push_opcode(opcode::OP_PUSHNUM_2)
             .push_opcode(opcode::OP_CHECKMULTISIG)
             .into_script();
@@ -540,25 +527,27 @@ pub struct BitMessagePreference {
 /// Contains all the parameters needed to send a bitmessage to a recipient.
 #[derive(Debug)]
 pub struct BitMessageSendParams {
-    pub signing_key: PublicKey,
-    pub encryption_key: PublicKey,
+    pub signing_key: CompressedPublicKey,
+    pub encryption_key: CompressedPublicKey,
     pub version: u8,
     pub stream_number: u8,
 }
 
 /// Calculates a secret point given a private key and a public key.
-fn secret_point(sk: &PrivateKey, mut pk: PublicKey) -> Result<[u8; 32], secp256k1::Error> {
-    pk.inner.mul_assign(&Secp256k1::new(), &sk.to_bytes())?;
+fn secret_point(sk: &PrivateKey, pk: CompressedPublicKey) -> Result<[u8; 32], secp256k1::Error> {
+    let sk_scalar = secp256k1::Scalar::from(sk.inner);
+    let tweaked = pk.0.mul_tweak(&Secp256k1::new(), &sk_scalar)?;
+    let compressed = &tweaked.serialize()[1..];
     let mut point = [0_u8; 32];
-    point.copy_from_slice(&pk.inner.serialize()[1..]);
+    point.copy_from_slice(compressed);
     Ok(point)
 }
 
 /// Calculates a shared secret given a secret point.
 fn shared_secret(secret_point: [u8; 32]) -> Result<[u8; 32], secp256k1::Error> {
     let hash = sha256::Hash::hash(&secret_point);
-    secp256k1::SecretKey::from_slice(&hash)?;
-    Ok(hash.into_inner())
+    secp256k1::SecretKey::from_slice(hash.as_byte_array())?;
+    Ok(hash.to_byte_array())
 }
 
 /// Calculates a blinding factor. The operation is symmetrical, therefore the key combination can be:
@@ -566,22 +555,23 @@ fn shared_secret(secret_point: [u8; 32]) -> Result<[u8; 32], secp256k1::Error> {
 /// 2. designated private key, notification public key
 pub fn blinding_factor(
     sk: &PrivateKey,
-    pk: &PublicKey,
+    pk: &CompressedPublicKey,
     utxo: &bitcoin::OutPoint,
 ) -> Result<[u8; 64], secp256k1::Error> {
-    let mut pk = pk.inner;
-    pk.mul_assign(&Secp256k1::new(), &sk.to_bytes())?;
+    let pk = pk.0;
+    let sk_scalar = secp256k1::Scalar::from(sk.inner);
+    let s = pk.mul_tweak(&Secp256k1::new(), &sk_scalar)?.serialize();
+    let s_input = &s[1..];
 
     let mut encoded_utxo = Vec::with_capacity(36);
-    encoded_utxo.extend_from_slice(&utxo.txid);
+    encoded_utxo.extend_from_slice(&utxo.txid.to_byte_array());
     encoded_utxo.extend_from_slice(&u32_to_le_bytes(utxo.vout));
 
-    use bitcoin::hashes::{self, sha512, HashEngine, Hmac};
     let mut hmac = hashes::hmac::HmacEngine::<sha512::Hash>::new(&encoded_utxo);
-    hmac.input(&pk.serialize()[1..]);
+    hmac.input(s_input);
     let hash = Hmac::<sha512::Hash>::from_engine(hmac);
 
-    Ok(hash.into_inner())
+    Ok(hash.to_byte_array())
 }
 
 /// Blinds a payment code using a byte mask.
@@ -602,25 +592,26 @@ fn make_v1_notification_scripts(
     recipient_code: &PublicCode,
     notification_sk: &PrivateKey,
     notification_utxo: &bitcoin::OutPoint,
-) -> Result<(Script, Script), Error> {
-    let notification_pk = recipient_code.child(0)?;
+) -> Result<(ScriptBuf, ScriptBuf), Error> {
+    let notification_pk: CompressedPublicKey = recipient_code.child(0)?;
     let blinding_factor = blinding_factor(notification_sk, &notification_pk, notification_utxo)?;
 
     let mut sender_code = sender_code.as_bytes();
     blind_payment_code(&mut sender_code, &blinding_factor);
+    let p2pkh_script = bitcoin::ScriptBuf::new_p2pkh(&notification_pk.pubkey_hash());
 
-    Ok((
-        bitcoin::Script::new_p2pkh(&notification_pk.pubkey_hash()),
-        bitcoin::Script::new_op_return(&sender_code),
-    ))
+    // Have to manually build the op_return because Push_Bytes only supports up to 75 bytes
+    // whereas we need 80 bytes going onto the stack.
+    let mut script_bytes = ENCODED_PCODE_PREFIX.to_vec();
+    script_bytes.extend_from_slice(&sender_code);
+    let op_return = ScriptBuf::from(script_bytes);
+    Ok((p2pkh_script, op_return))
 }
 
 /// Attempts to extract the designated input and its associated pubkey from a transaction.
 /// A designated input is the first input whose scriptsig or witness exposes a pubkey
 /// (designated pubkey).
 fn find_designated(tx: &Transaction) -> Option<(PublicKey, OutPoint)> {
-    use bitcoin::blockdata::script::Instruction::PushBytes;
-
     fn from_scriptsig(tx: &Transaction) -> Option<(PublicKey, OutPoint)> {
         tx.input
             .iter()
@@ -629,7 +620,7 @@ fn find_designated(tx: &Transaction) -> Option<(PublicKey, OutPoint)> {
                     .script_sig
                     .instructions()
                     .filter_map(|op| match op {
-                        Ok(PushBytes(bytes)) => PublicKey::from_slice(bytes).ok(),
+                        Ok(PushBytes(bytes)) => PublicKey::from_slice(bytes.as_bytes()).ok(),
                         _ => None,
                     })
                     .next();
@@ -657,35 +648,46 @@ fn find_designated(tx: &Transaction) -> Option<(PublicKey, OutPoint)> {
     from_scriptsig(tx).or_else(|| from_witness(tx))
 }
 
-/// Represents an error as pertaining to BIP47 operations.
-#[derive(Debug, PartialEq, Eq, Clone)]
+/// Retrieves address from given compressed public key
+fn get_address_from_pubkey(
+    pk: &CompressedPublicKey,
+    network: Network,
+    address_type: &AddressType,
+) -> Result<Address, Error> {
+    match address_type {
+        AddressType::P2PKH => Ok(Address::p2pkh(pk, network)),
+        AddressType::P2WPKH => Ok(Address::p2wpkh(pk, network)),
+    }
+}
+
+#[derive(Debug, Error)]
 pub enum Error {
+    #[error("Format error: {0}")]
     Format(&'static str),
-    Base58(base58::Error),
-    Bip32(bip32::Error),
-    Ecdsa(secp256k1::Error),
+    #[error("Base58 error: {0}")]
+    Base58(#[from] base58::Error),
+    #[error("BIP32 error: {0}")]
+    Bip32(#[from] bip32::Error),
+    #[error("ECDSA error: {0}")]
+    Ecdsa(#[from] secp256k1::Error),
+    #[error("Unsupported version")]
     UnsupportedVersion,
+    #[error("Notification error: {0}")]
     Notification(&'static str),
-    Address(address::Error),
-    Key(bitcoin::util::key::Error),
-}
-
-impl From<bip32::Error> for Error {
-    fn from(error: bip32::Error) -> Self {
-        Error::Bip32(error)
-    }
-}
-
-impl From<secp256k1::Error> for Error {
-    fn from(error: secp256k1::Error) -> Self {
-        Error::Ecdsa(error)
-    }
-}
-
-impl From<bitcoin::util::key::Error> for Error {
-    fn from(error: bitcoin::util::key::Error) -> Self {
-        Error::Key(error)
-    }
+    #[error("Address error: {0}")]
+    Address(#[from] address::ParseError),
+    #[error("Key error: {0}")]
+    P2SH(#[from] address::P2shError),
+    #[error("P2SH creation error: {0}")]
+    Key(#[from] UncompressedPublicKeyError),
+    #[error("Key from slice error: {0}")]
+    KeyFromSlice(#[from] bitcoin::key::FromSliceError),
+    #[error("Scalar range error: {0}")]
+    ScalarRange(#[from] secp256k1::scalar::OutOfRangeError),
+    #[error("Array conversion error: {0}")]
+    ArrayConversion(#[from] std::array::TryFromSliceError),
+    #[error("Push bytes conversion error: {0}")]
+    PushBytesConversion(#[from] bitcoin::script::PushBytesError),
 }
 
 fn u32_to_le_bytes(x: u32) -> [u8; 4] {
@@ -705,14 +707,16 @@ mod tests {
 
     extern crate bitcoin;
 
-    use bitcoin::hashes::{self, hex::HexIterator};
-    use bitcoin::secp256k1::Secp256k1;
-    use bitcoin::util::psbt::serialize::Deserialize;
-    use bitcoin::{Address, Network, PrivateKey, PublicKey};
+    use bitcoin::{
+        address::Address, consensus::Decodable, hashes, hex::prelude::*, secp256k1::Secp256k1,
+        CompressedPublicKey, Network, PrivateKey, PublicKey, Transaction,
+    };
+    use std::io::Cursor;
 
     use super::{
-        blind_payment_code, blinding_factor, find_designated, make_v1_notification_scripts,
-        secret_point, NotificationMode, PrivateCode, PublicCode,
+        blind_payment_code, blinding_factor, find_designated, get_address_from_pubkey,
+        make_v1_notification_scripts, secret_point, AddressType, NotificationMode, PrivateCode,
+        PublicCode,
     };
 
     const ALICE_BIP32_SEED: &str = "64dca76abc9c6f0cf3d212d248c380c4622c8f93b2c425ec6a5567fd5db57e10d3e6f94a2f6af4ac2edb8998072aad92098db73558c323777abf5bd1082d970a";
@@ -762,11 +766,8 @@ mod tests {
     000000000000536a4c50010002063e4eb95e62791b06c50e1a3a942e1ecaaa9afbbeb324d16ae6821e091611fa96c0c\
     f048f607fe51a0327f5e2528979311c78cb2de0d682c61e1180fc3d543b0000000000000000000000000000000000";
 
-    fn from_hex(hex: &str) -> Vec<u8> {
-        HexIterator::new(hex)
-            .unwrap()
-            .filter_map(|a| a.ok())
-            .collect()
+    fn from_hex(value: &str) -> Vec<u8> {
+        Vec::from_hex(value).unwrap()
     }
 
     fn to_hex(bytes: &[u8]) -> Option<String> {
@@ -780,7 +781,7 @@ mod tests {
     #[test]
     fn test_payment_code_from_seed() {
         let seed: Vec<u8> = hashes::hex::FromHex::from_hex(ALICE_BIP32_SEED).unwrap();
-        let private = PrivateCode::from_seed(&seed, 0, Network::Bitcoin).unwrap();
+        let private = PrivateCode::from_seed(&seed, Network::Bitcoin, Some(0), None).unwrap();
         let public = private.v1_public_code(None);
 
         assert_eq!(public.to_string(), ALICE_PAYMENT_CODE);
@@ -797,11 +798,15 @@ mod tests {
     fn test_notification_address() {
         // Alice
         let alice_payment_code = PublicCode::from_wif(ALICE_PAYMENT_CODE).unwrap();
+        let alice_expected_address = Address::from_str(ALICE_NOTIFICATION_ADDRESS)
+            .unwrap()
+            .assume_checked();
+
         if let NotificationMode::BasicTransaction(onchain) = alice_payment_code.notification_mode()
         {
             assert_eq!(
-                onchain.notification_address(false).unwrap(),
-                Address::from_str(ALICE_NOTIFICATION_ADDRESS).unwrap()
+                onchain.notification_address(&AddressType::P2PKH).unwrap(),
+                alice_expected_address
             );
         } else {
             panic!("should not be using bitmessage here");
@@ -809,11 +814,13 @@ mod tests {
 
         // Bob
         let bob_payment_code = PublicCode::from_wif(BOB_PAYMENT_CODE).unwrap();
-
+        let bob_expected_address = Address::from_str(BOB_NOTIFICATION_ADDRESS)
+            .unwrap()
+            .assume_checked();
         if let NotificationMode::BasicTransaction(onchain) = bob_payment_code.notification_mode() {
             assert_eq!(
-                onchain.notification_address(false).unwrap(),
-                Address::from_str(BOB_NOTIFICATION_ADDRESS).unwrap()
+                onchain.notification_address(&AddressType::P2PKH).unwrap(),
+                bob_expected_address
             );
         } else {
             panic!("should not be using bitmessage here");
@@ -825,7 +832,8 @@ mod tests {
     fn test_ecdh_params() {
         // Alice
         let alice_seed: Vec<u8> = hashes::hex::FromHex::from_hex(ALICE_BIP32_SEED).unwrap();
-        let alice_private = PrivateCode::from_seed(&alice_seed, 0, Network::Bitcoin).unwrap();
+        let alice_private =
+            PrivateCode::from_seed(&alice_seed, Network::Bitcoin, Some(0), None).unwrap();
 
         let alice_a0 = alice_private.child(0).unwrap();
         let alice_A0 = PublicKey::from_private_key(&Secp256k1::new(), &alice_a0);
@@ -834,7 +842,8 @@ mod tests {
 
         // Bob
         let bob_seed: Vec<u8> = hashes::hex::FromHex::from_hex(BOB_BIP32_SEED).unwrap();
-        let bob_private = PrivateCode::from_seed(&bob_seed, 0, Network::Bitcoin).unwrap();
+        let bob_private =
+            PrivateCode::from_seed(&bob_seed, Network::Bitcoin, Some(0), None).unwrap();
 
         let bob_b0 = bob_private.child(0).unwrap();
         let bob_b1 = bob_private.child(1).unwrap();
@@ -861,14 +870,17 @@ mod tests {
 
     #[test]
     fn test_secret_point_alice_side() {
-        let sk = PrivateKey::from_slice(&from_hex(&ALICE_a0), bitcoin::Network::Bitcoin).unwrap();
-        let pk0 = PublicKey::from_slice(&from_hex(&BOB_B0)).unwrap();
-        let pk1 = PublicKey::from_slice(&from_hex(&BOB_B1)).unwrap();
-        let pk2 = PublicKey::from_slice(&from_hex(&BOB_B2)).unwrap();
+        let sk = PrivateKey::from_slice(&from_hex(ALICE_a0), bitcoin::Network::Bitcoin).unwrap();
+        let pk0 = PublicKey::from_slice(&from_hex(BOB_B0)).unwrap();
+        let pk0_c = CompressedPublicKey::try_from(pk0).unwrap();
+        let pk1 = PublicKey::from_slice(&from_hex(BOB_B1)).unwrap();
+        let pk1_c = CompressedPublicKey::try_from(pk1).unwrap();
+        let pk2 = PublicKey::from_slice(&from_hex(BOB_B2)).unwrap();
+        let pk2_c = CompressedPublicKey::try_from(pk2).unwrap();
 
-        let sp0 = secret_point(&sk, pk0).unwrap();
-        let sp1 = secret_point(&sk, pk1).unwrap();
-        let sp2 = secret_point(&sk, pk2).unwrap();
+        let sp0 = secret_point(&sk, pk0_c).unwrap();
+        let sp1 = secret_point(&sk, pk1_c).unwrap();
+        let sp2 = secret_point(&sk, pk2_c).unwrap();
 
         assert_eq!(SECRET_POINT_0, to_hex(&sp0).unwrap());
         assert_eq!(SECRET_POINT_1, to_hex(&sp1).unwrap());
@@ -877,14 +889,15 @@ mod tests {
 
     #[test]
     fn test_secret_point_bob_side() {
-        let pk = PublicKey::from_slice(&from_hex(&ALICE_A0)).unwrap();
-        let sk0 = PrivateKey::from_slice(&from_hex(&BOB_b0), bitcoin::Network::Bitcoin).unwrap();
-        let sk1 = PrivateKey::from_slice(&from_hex(&BOB_b1), bitcoin::Network::Bitcoin).unwrap();
-        let sk2 = PrivateKey::from_slice(&from_hex(&BOB_b2), bitcoin::Network::Bitcoin).unwrap();
+        let pk = PublicKey::from_slice(&from_hex(ALICE_A0)).unwrap();
+        let pk_c = CompressedPublicKey::try_from(pk).unwrap();
+        let sk0 = PrivateKey::from_slice(&from_hex(BOB_b0), bitcoin::Network::Bitcoin).unwrap();
+        let sk1 = PrivateKey::from_slice(&from_hex(BOB_b1), bitcoin::Network::Bitcoin).unwrap();
+        let sk2 = PrivateKey::from_slice(&from_hex(BOB_b2), bitcoin::Network::Bitcoin).unwrap();
 
-        let sp0 = secret_point(&sk0, pk).unwrap();
-        let sp1 = secret_point(&sk1, pk).unwrap();
-        let sp2 = secret_point(&sk2, pk).unwrap();
+        let sp0 = secret_point(&sk0, pk_c).unwrap();
+        let sp1 = secret_point(&sk1, pk_c).unwrap();
+        let sp2 = secret_point(&sk2, pk_c).unwrap();
 
         assert_eq!(SECRET_POINT_0, to_hex(&sp0).unwrap());
         assert_eq!(SECRET_POINT_1, to_hex(&sp1).unwrap());
@@ -893,15 +906,17 @@ mod tests {
 
     #[test]
     fn test_payment_address_alice_side() {
+        let addr_type = AddressType::P2PKH;
         let alice_seed: Vec<u8> =
             bitcoin::hashes::hex::FromHex::from_hex(ALICE_BIP32_SEED).unwrap();
-        let alice_private = PrivateCode::from_seed(&alice_seed, 0, Network::Bitcoin).unwrap();
+        let alice_private =
+            PrivateCode::from_seed(&alice_seed, Network::Bitcoin, Some(0), None).unwrap();
 
         let bob_public = PublicCode::from_wif(BOB_PAYMENT_CODE).unwrap();
 
-        let addr_0 = bob_public.address(&alice_private, 0, false).unwrap();
-        let addr_1 = bob_public.address(&alice_private, 1, false).unwrap();
-        let addr_2 = bob_public.address(&alice_private, 2, false).unwrap();
+        let addr_0 = bob_public.address(&alice_private, 0, &addr_type).unwrap();
+        let addr_1 = bob_public.address(&alice_private, 1, &addr_type).unwrap();
+        let addr_2 = bob_public.address(&alice_private, 2, &addr_type).unwrap();
 
         assert_eq!(BOB_ADDR_0, addr_0.to_string());
         assert_eq!(BOB_ADDR_1, addr_1.to_string());
@@ -910,14 +925,16 @@ mod tests {
 
     #[test]
     fn test_payment_address_bob_side() {
+        let addr_type = AddressType::P2PKH;
         let alice_public = PublicCode::from_wif(ALICE_PAYMENT_CODE).unwrap();
 
         let bob_seed: Vec<u8> = bitcoin::hashes::hex::FromHex::from_hex(BOB_BIP32_SEED).unwrap();
-        let bob_private = PrivateCode::from_seed(&bob_seed, 0, Network::Bitcoin).unwrap();
+        let bob_private =
+            PrivateCode::from_seed(&bob_seed, Network::Bitcoin, Some(0), None).unwrap();
 
-        let addr_0 = bob_private.address(&alice_public, 0, false).unwrap();
-        let addr_1 = bob_private.address(&alice_public, 1, false).unwrap();
-        let addr_2 = bob_private.address(&alice_public, 2, false).unwrap();
+        let addr_0 = bob_private.address(&alice_public, 0, &addr_type).unwrap();
+        let addr_1 = bob_private.address(&alice_public, 1, &addr_type).unwrap();
+        let addr_2 = bob_private.address(&alice_public, 2, &addr_type).unwrap();
 
         assert_eq!(BOB_ADDR_0, addr_0.to_string());
         assert_eq!(BOB_ADDR_1, addr_1.to_string());
@@ -928,7 +945,7 @@ mod tests {
     fn test_blinding() {
         let bob_public = PublicCode::from_wif(BOB_PAYMENT_CODE).unwrap();
 
-        let alice_designated_sk = PrivateKey::from_wif(&ALICE_DESIGNATED_PRIVATE_KEY).unwrap();
+        let alice_designated_sk = PrivateKey::from_wif(ALICE_DESIGNATED_PRIVATE_KEY).unwrap();
         let pk = bob_public.child(0).unwrap();
         let utxo = bitcoin::OutPoint::from_str(ALICE_NOTIFICATION_UTXO).unwrap();
 
@@ -986,7 +1003,10 @@ mod tests {
     #[test]
     fn test_find_designated_in_notification() {
         // p2pkh
-        let tx = bitcoin::Transaction::deserialize(&from_hex(NOTIFICATION_TX)).unwrap();
+
+        let tx_bytes = Vec::<u8>::from_hex(NOTIFICATION_TX).expect("Invalid hex");
+        let mut cursor = Cursor::new(tx_bytes);
+        let tx = Transaction::consensus_decode(&mut cursor).expect("Failed to decode transaction");
 
         let expected_designated_input =
             bitcoin::OutPoint::from_str(ALICE_NOTIFICATION_UTXO).unwrap();
@@ -1005,25 +1025,35 @@ mod tests {
         )
         .unwrap();
         let expected_segwit_address =
-            Address::from_str("bc1qpflfdc2fu9e4udp788h0pdrehjf202h75m86s0");
+            Address::from_str("bc1qpflfdc2fu9e4udp788h0pdrehjf202h75m86s0")
+                .unwrap()
+                .assume_checked();
 
-        let segwit_tx = bitcoin::Transaction::deserialize(&from_hex("01000000000101f63960ec71db81886392fb3643471183218cf9d74e2987b0ddf57ab5462ada1f5b000000000000000001aa7c0100000000001600145866fcd59dcdabf34dee30abd4c9924ec387830402483045022100f31b80da6c620a2f9d12b65b2010d962390f57560169dde54368b4b5cf122b11022001915d1693cac8bea16e28d941ed7a34eec3bb231a475f5d1616cf5af3f13329012102df62d69f610e2bf7463480a8dd52b96aefeeb3111d66e5e579a0971bc41ce77200000000")).unwrap();
+        let segwit_bytes = Vec::<u8>::from_hex("01000000000101f63960ec71db81886392fb3643471183218cf9d74e2987b0ddf57ab5462ada1f5b000000000000000001aa7c0100000000001600145866fcd59dcdabf34dee30abd4c9924ec387830402483045022100f31b80da6c620a2f9d12b65b2010d962390f57560169dde54368b4b5cf122b11022001915d1693cac8bea16e28d941ed7a34eec3bb231a475f5d1616cf5af3f13329012102df62d69f610e2bf7463480a8dd52b96aefeeb3111d66e5e579a0971bc41ce77200000000").expect("Invalid hex");
+        let mut segwit_cursor = Cursor::new(segwit_bytes);
+        let segwit_tx = Transaction::consensus_decode(&mut segwit_cursor)
+            .expect("Failed to decode segwit transaction");
 
         let (actual_segwit_pk, actual_segwit_input) = find_designated(&segwit_tx).unwrap();
 
         assert_eq!(expected_segwit_input, actual_segwit_input);
+        let compressed_segwit = CompressedPublicKey::try_from(actual_segwit_pk).unwrap();
         assert_eq!(
             expected_segwit_address,
-            Address::p2wpkh(&actual_segwit_pk, Network::Bitcoin)
+            get_address_from_pubkey(&compressed_segwit, Network::Bitcoin, &AddressType::P2WPKH)
+                .unwrap()
         );
     }
 
     #[test]
     fn test_extract_payment_code_from_tx() {
-        let tx = bitcoin::Transaction::deserialize(&from_hex(NOTIFICATION_TX)).unwrap();
+        let tx_bytes = Vec::<u8>::from_hex(NOTIFICATION_TX).expect("Invalid hex");
+        let mut cursor = Cursor::new(tx_bytes);
+        let tx = Transaction::consensus_decode(&mut cursor).expect("Failed to decode transaction");
 
         let bob_seed: Vec<u8> = bitcoin::hashes::hex::FromHex::from_hex(BOB_BIP32_SEED).unwrap();
-        let bob_private = PrivateCode::from_seed(&bob_seed, 0, Network::Bitcoin).unwrap();
+        let bob_private =
+            PrivateCode::from_seed(&bob_seed, Network::Bitcoin, Some(0), None).unwrap();
 
         let alice_public = PublicCode::from_notification(&bob_private, None, &tx).unwrap();
         assert_eq!(
